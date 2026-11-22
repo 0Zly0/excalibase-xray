@@ -1,0 +1,15 @@
+const http = require('http');
+const net = require('net');
+const { WebSocketServer } = require('ws');
+const PORT = parseInt(process.env.PORT || '8080', 10);
+const UUID_HEX = (process.env.UUID || '').replace(/-/g, '').toLowerCase();
+const WSPATH = '/' + (process.env.WS_PATH || '').replace(/^\//, '');
+if (!UUID_HEX || !process.env.WS_PATH) { console.error('missing UUID or WS_PATH env'); process.exit(1); }
+const server = http.createServer((req, res) => { res.writeHead(200, { 'Content-Type': 'text/plain' }); res.end('ok'); });
+const wss = new WebSocketServer({ noServer: true });
+server.on('upgrade', (req, socket, head) => { const url = (req.url || '').split('?')[0]; if (url !== WSPATH) { socket.destroy(); return; } wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req)); });
+wss.on('connection', (ws) => { let headerBuf = Buffer.alloc(0); let target = null; let headerDone = false; let earlyChunks = [];
+  ws.on('message', (data) => { const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data); if (target) { target.write(chunk); return; } if (headerDone) { earlyChunks.push(chunk); return; } headerBuf = Buffer.concat([headerBuf, chunk]); const parsed = parseHeader(headerBuf); if (parsed === null) return; if (parsed.error) { ws.close(); return; } headerDone = true; const { host, port, payload } = parsed; target = net.connect(port, host, () => { ws.send(Buffer.from([0, 0])); if (payload.length) target.write(payload); for (const c of earlyChunks) target.write(c); earlyChunks = []; }); target.on('data', (d) => { if (ws.readyState === ws.OPEN) ws.send(d); }); target.on('error', () => { try { ws.close(); } catch {} }); target.on('close', () => { try { ws.close(); } catch {} }); });
+  ws.on('close', () => { if (target) target.destroy(); }); ws.on('error', () => { if (target) target.destroy(); }); });
+function parseHeader(buf) { if (buf.length < 22) return null; if (buf[0] !== 0) return { error: 'bad version' }; const uuid = buf.subarray(1, 17).toString('hex'); if (uuid !== UUID_HEX) return { error: 'bad uuid' }; let idx = 17; const optLen = buf[idx]; idx += 1 + optLen; if (buf.length < idx + 4) return null; const cmd = buf[idx]; idx += 1; if (cmd !== 1) return { error: 'only TCP supported' }; const port = buf.readUInt16BE(idx); idx += 2; const atyp = buf[idx]; idx += 1; let host; if (atyp === 1) { if (buf.length < idx + 4) return null; host = Array.from(buf.subarray(idx, idx + 4)).join('.'); idx += 4; } else if (atyp === 2) { if (buf.length < idx + 1) return null; const len = buf[idx]; idx += 1; if (buf.length < idx + len) return null; host = buf.subarray(idx, idx + len).toString('utf8'); idx += len; } else if (atyp === 3) { if (buf.length < idx + 16) return null; const parts = []; for (let i = 0; i < 8; i++) parts.push(buf.readUInt16BE(idx + i * 2).toString(16)); host = parts.join(':'); idx += 16; } else { return { error: 'bad atyp' }; } return { host, port, payload: buf.subarray(idx) }; }
+server.listen(PORT, '0.0.0.0', () => console.log('vless-ws listening on', PORT, 'path', WSPATH));
